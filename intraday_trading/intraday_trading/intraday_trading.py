@@ -1,11 +1,9 @@
 import numpy as np
 import pandas as pd
-import os
 import datetime
 from sklearn.linear_model import LinearRegression, Lasso, LassoCV, ElasticNet, ElasticNetCV, Ridge, RidgeCV 
 from statsmodels.tsa.arima_model import ARIMA
-from statsmodels.tsa.stattools import adfuller, kpss
-from statsmodels.tsa.stattools import acf, pacf
+from statsmodels.tsa.stattools import adfuller, kpss, acf, pacf
 from plotly.offline import plot
 from plotly.graph_objs import Scattergl
 
@@ -21,17 +19,18 @@ def dataset_building(n_max=None, verbose=None):
     #cd=os.getcwd()
     stock_data=pd.read_csv('C:/Users/Loic/Documents/work/interview/maven/reference.data/stock.data.csv')
     index_data=pd.read_csv('C:/Users/Loic/Documents/work/interview/maven/reference.data/reference.data.csv')
-        
+       
     for data in [stock_data, index_data]:
         data.set_index(data.columns[0],inplace=True)
         data.index=pd.to_datetime(data.index,infer_datetime_format=True) # Speed optimized after testing
         # Make sure the date index is ascending, we avoid to sort because of the complexity
         data=data.sort_index(axis=0,ascending=True)
        
-        # Cut the dataset to a lower number of obs
-        if n_max is not None:
-            data = data.iloc[-(n_max + 1):]     
-       
+    # Cut the dataset to a lower number of obs
+    if n_max is not None:
+        stock_data=stock_data.iloc[-(n_max + 1):]       
+        index_data=index_data.iloc[-(n_max + 1):]
+
     if verbose: print('Dataset built')
 
     return stock_data, index_data
@@ -44,11 +43,11 @@ def compute_prices(df):
     factor=pd.Series(100,index=df.columns) # we initialize the prices at 100
     last_timestamp=df.index[0]
     for i in df.index:
-        if i.date != last_timestamp.date: # If we change the day
+        if i.date() != last_timestamp.date(): # If we change the day
             factor=res.loc[last_timestamp,:] # then we take as factor the last closing price
             last_timestamp=i
-        res.loc[i,:]=df.loc[i,:]*factor # we multiply by the last closing price
-    return res        
+        res.loc[i,:]=(1+df.loc[i,:])*factor # we multiply by the last closing price
+    return res
 
 def compute_returns(df, col_index=None, window=1):
     ''' Compute the returns for some preselected columns of the dataset
@@ -61,16 +60,13 @@ def compute_returns(df, col_index=None, window=1):
         res[col] = ((1+df.loc[:,col])/(1+df.loc[:,col].shift(window))) - 1
     return res
 
-stock_data,index_data=dataset_building(verbose=1)
-stock_prices=compute_prices(stock_data)
-index_prices=compute_prices(index_data)
-stock_returns=compute_returns(stock_prices) # This compute the 2 min return
-index_returns=compute_returns(index_prices)
-
-data_returns=stock_returns.join(index_returns, how='outer')
-data_prices=stock_prices.join(index_prices, how='outer')
-data_returns.dropna(inplace=True) # This deletes a lot of data, we should find a clever way to deal with closed markets or restrict the number of assets
-data_prices.dropna(inplace=True)
+stock_data,index_data=dataset_building(n_max=10000,verbose=1)
+#data=stock_data.join(index_data,how='outer')
+data=index_data
+data.dropna(inplace=True)
+data_prices=compute_prices(data).apply(pd.to_numeric)
+data_returns=compute_returns(data_prices)
+data_returns.dropna(inplace=True)
 
 ##########################################################################################################
 ### MODEL ###
@@ -84,64 +80,6 @@ lasso={asset:Lasso() for asset in data_prices.columns}
 models=lr
 
 ##########################################################################################################
-### GLOBAL LOOK AT THE DATA ###
-##########################################################################################################
-
-# We will test our hypothesis about the market behavior by
-# building a system of linear models on 
-
-n_testing_days=10
-last_sample_day=data_returns.index[0]+datetime.timedelta(days=n_testing_days) 
-last_sample_day_index=data_returns.index.get_loc(last_sample_day, method='ffill')
-sample_index=data_returns.index[:last_sample_day_index]
-
-# We will store the redisuals, and results to ouor tests
-resi={}
-adf_res={}
-kpss_res={}
-arima_res={}
-acf_res={}
-pacf_res={}
-
-for asset in data_returns.columns:
-    other_assets=data_returns.columns.drop(asset)
-    Y=data_returns.loc[sample_index,asset]
-    X=data_returns.loc[sample_index, other_assets]
-    lr[asset].fit(X, Y) # we fit the model
-    resi[asset]=Y-lr[asset].predict(X) # compute the residuals
-    adf_res[asset]=adfuller(resi[asset])   # we first test for the stationarity of the residuals       
-    kpss_res[asset]=kpss(resi[asset])     # we test for the mean reverting behavior of the residuals
-
-pvalues_adf=[adf_res[asset][1] for asset in data_returns.columns] # very low p values for ADF
-pvalues_kpss=[kpss_res[asset][1] for asset in data_returns.columns] # very high (max is 0.1) p values for KPSS
-# The tests confirm the stationary hypothesis on the residuals
-
-for asset in data_returns.columns:
-   # we have stationarity, so we know d=0 in our arima, to find p and d we need to look at the ACF and PACF
-   acf_res[asset]=acf(resi[asset],qstat=True)
-   pacf_res[asset]=pacf(resi[asset])
-
-# We look at the p values  for the first coefficiant of the ljung box test
-# If the p value s small then we have a significative first autocorrelation
-# This would mean that we have a very short term momentum or mean reverting on our residuals
-pvalues_ljung_box_first=[(acf_res[asset][2][0]) for asset in data_returns.columns]
-pvalues_ljung_box_second=[(acf_res[asset][2][1]) for asset in data_returns.columns]
-# We see that some p values are high but most of them are very low, we do have an effect to capture here
-sign_first_acf=[(np.sign(acf_res[asset][0][1])) for asset in data_returns.columns]
-# The sign of the first acf coef is always negative: we have a mean reverting effect on the first period
-sign_second_acf=[(np.sign(acf_res[asset][0][2])) for asset in data_returns.columns]
-# looking at the next coefficiants shows us that actually the mean reverting effect last a few periods (around 5/6)
-# but it is much more unclear, we need to make sure to close very soon the positions
-
-# ARIMA?????
-   #arima[asset]=ARIMA(resi, order=(5,0,5)) # d=0 because we have stationarity
-   
-
-# Of course there tests are based on a sample and should be taken carefully
-# In order to check if this strategy could really make money we need to code it properly by simulating 
-# a trading environment with no look ahead bias
-
-##########################################################################################################
 ### TRADING STRATEGY ###
 ##########################################################################################################
 
@@ -149,55 +87,163 @@ sign_second_acf=[(np.sign(acf_res[asset][0][2])) for asset in data_returns.colum
 # Every 2 min we will look at the residuals of our assets versus our predicted assets
 # the prediction will be based on the linear models built using the information from the rolling window
 
-rolling_window_size=256 # The number of data points we need to build our models, 256 for one day
 
+# Global params
+rolling_window_size=720 # The number of data points we need to build our models, 720 for one day
+transaction_cost=0.05 # in returns for a trade (entry and exit included)
+data_size=len(data_returns.index)
+validation_set_size=int(data_size/4)
+testing_set_size=data_size-validation_set_size
+
+
+# Hyperparameters grid: 
+threshold_grid=[2,3,4,5] # the limit on z score of the residual after which we trade
+max_holding_period_grid=[1,5,10,15] # holding period of the positions
+
+# We define a class to keep track of our trading strategy
+class trading_strategy():
+    ''' This class will help us keep track of our trading strategy '''
+    def __init__(self, models, data_returns, data_prices, rolling_window_size, transaction_cost):
+        self.models=models
+        self.data_returns=data_returns
+        self.data_prices=data_prices
+        self.transaction_cost=transaction_cost
+        self.rolling_window_size=rolling_window_size
+        self.norm_resi={} # The norm residuals are the residuals normalized by their std dev
+        self.ret=pd.Series(0.0,index=data_returns.index) # keep track of the realized pnl
+        self.pos=pd.DataFrame(0.0,index=data_returns.index, columns=data_prices.columns) # keep track of the positions
+        self.norm_resi=pd.DataFrame(index=data_returns.index, columns=data_prices.columns) # nomalized residuals
+        self.active_pos=False # this will help us keep track of our open strategy, and make sure we have only one strategy running at the same time
+        self.holding_period=0
+        self.entry_prices=pd.DataFrame()
+        self.best_hp={}
+        self.best_score_valid=-np.Inf
+
+        # Hyperparameters
+        self.threshold=None
+        self.max_holding_period=None
+
+    def reinit(self):
+        self.norm_resi={} # The norm residuals are the residuals normalized by their std dev
+        self.ret=pd.Series(0.0,index=data_returns.index) # keep track of the realized pnl
+        self.pos=pd.DataFrame(0.0,index=data_returns.index, columns=data_prices.columns) # keep track of the positions
+        self.norm_resi=pd.DataFrame(index=data_returns.index, columns=data_prices.columns) # nomalized residuals
+        self.active_pos=False # this will help us keep track of our open strategy, and make sure we have only one strategy running at the same time
+        self.holding_period=0
+        self.entry_prices=pd.DataFrame()
+        
+    def one_period(self, i):
+        ''' This function will operate one trading period '''
+        today=self.data_returns.index[i]
+        print(today) # debug
+        if not self.active_pos:
+            train=self.data_returns.index[i-self.rolling_window_size:i-1]
+            for asset in self.data_returns.columns:  
+                other_assets=self.data_returns.columns.drop(asset)
+                Y=self.data_returns.loc[train,asset]
+                X=self.data_returns.loc[train,other_assets]
+                self.models[asset].fit(X, Y)
+                resi=Y-self.models[asset].predict(X) # These are the residuals
+                self.norm_resi.loc[today,asset]=resi[-1]/np.std(resi) # This is our last residual 
+                if abs(self.norm_resi.loc[today,asset])>self.threshold:
+                    self.pos.loc[today,asset]=-np.sign(self.norm_resi.loc[today,asset]) # we take a position on the asset
+                    self.pos.loc[today,other_assets]=np.sign(self.norm_resi.loc[today,asset])*models[asset].coef_ # we build the arbitrage portfolio
+                    self.holding_period=0
+                    self.entry_prices=self.data_prices.loc[today,:] # we record the entry prices
+                    self.active_pos=True
+                    print('position open')
+                    return
+            return
+        else: # in case of an active position we just wait for the mean reversion
+            self.holding_period += 1
+            self.pos.iloc[i,:]=self.pos.iloc[i-1,:]
+            if self.holding_period>=self.max_holding_period: # we close after a few periods, and record the pnl of the trade
+                self.ret[today]=sum(self.pos.loc[today,:]*((self.data_prices.loc[today,:]-self.entry_prices)/self.entry_prices-self.transaction_cost))
+                self.pos.loc[today,:]=0.0
+                self.active_pos=False
+                print('position closed, Return: {:f}'.format(self.ret[today]))
+            return
+    
+    def set_hp(self, **kwargs):
+        ''' Used to change the value of the hyperparameters '''
+        for name in kwargs:
+            setattr(self,name, kwargs[name])
+ 
+    def print_cumret(self):
+        ''' Used to print the cumulated returns '''
+        cumret=self.ret.cumsum()
+        plot([Scattergl(x=cumret.index,y=cumret)])
+
+TS=trading_strategy(models, data_returns, data_prices, rolling_window_size, transaction_cost)
+
+# Validation
+for threshold in threshold_grid:
+    TS.reinit()
+    for max_holding_period in max_holding_period_grid:
+        print('Threshold:{}, Max Holding Period:{}'.format(threshold, max_holding_period))
+        TS.set_hp(threshold=threshold, max_holding_period=max_holding_period)
+        for i in range(rolling_window_size,validation_set_size):
+            TS.one_period(i)
+        score=TS.ret.sum()
+        if score>TS.best_score_valid:
+            TS.best_score_valid=score
+            TS.best_hp={'threshold':threshold, 'max_holding_period':max_holding_period}
+    
+# Testing
+TS.reinit()
+TS.set_hp(*{TS.best_hp})
+for i in range(rolling_window_size,len(data.returns)):
+    TS.one_period(i)
+
+
+##########################################################################################################
+### OUTPUTS & STAT TESTS ###
+##########################################################################################################
+
+### Before checking the PnL let us check some of our assumptions
+
+# The most important is the mean reverting behavior of our residuals
 resi={}
-norm_resi={} # The norm residuals are the residuals normalized by their std dev
-pnl=pd.Series(0,index=data_returns.index) # keep track of the realized pnl
-pos=pd.DataFrame(0,index=data_returns.index, columns=data_prices.columns) # keep track of the positions
+adf_res={}
+kpss_res={}
+arima_res={}
+acf_res={}
+pacf_res={}
 
-active_pos=False # this will help us keep track of our open strategy, and make sure we have only one strategy running at the same time
+# Stationarity tests
+for asset in data_returns.columns:
+    adf_res[asset]=adfuller(norm_resi[asset])         
+    kpss_res[asset]=kpss(norm_resi[asset])
 
-# Hyperparameter: the limit on z score of the residual after which we trade
-threshold=2
-max_holding_period=5 # we define a max holding period
+pvalues_adf=[adf_res[asset][1] for asset in data_returns.columns] # very low p values for ADF
+pvalues_kpss=[kpss_res[asset][1] for asset in data_returns.columns] # very high (max is 0.1) p values for KPSS
+# The test seems to confirm  the stationarity of this time serie
 
-# information will keep track of during the strategy
-holding_period=0
-entry_prices=pd.DataFrame()
 
-for i in range(rolling_window_size,len(data_returns.index)):
-    today=data_returns.index[i]
-    print(today) # debug
-    if i > 1000:
-        break
-    if not active_pos:
-        train=data_returns.index[i-rolling_window_size:i-1]
-        for asset in data_returns.columns:  
-            other_assets=data_returns.columns.drop(asset)
-            Y=data_returns.loc[train,asset]
-            X=data_returns.loc[train,other_assets]
-            models[asset].fit(X, Y)
-            resi=Y-models[asset].predict(X) # These are the residuals
-            norm_resi=resi[-1]/np.std(resi) # This is our last residual 
-            if abs(norm_resi)>threshold:
-                pos.loc[today,asset]=-np.sign(norm_resi) # we take a position on the asset
-                for other_asset in other_assets:
-                    j=other_assets.get_loc(other_asset)
-                    pos.loc[today,other_asset]=np.sign(norm_resi)*models[asset].coef_[j] # we build the arbitrage portfolio
-                holding_period=0
-                entry_prices=data_prices.loc[today,:] # we record the entry prices
-                active_pos=True
-                print('position open')
-                break # we stop looping through assets if we take a position
-    else: # in case of an active position we just wait for the mean reversion
-        holding_period += 1
-        pos.iloc[i,:]=pos.iloc[i-1,:]
-        if holding_period>=max_holding_period: # we close after a few periods, and record the pnl of the trade
-            pnl[today]=sum(pos.loc[today,:]*(data_prices.loc[today,:]-entry_prices))
-            pos.loc[today,:]=0
-            active_pos=False
-            print('position closed')
+# ACF and PACF to check the mean reverting effect
+for asset in data_returns.columns:
+   acf_res[asset]=acf(norm_resi[asset],qstat=True)
+   pacf_res[asset]=pacf(norm_resi[asset])
+
+# We look at the p values for the first and second coefficiant of the ljung box test
+# If the p value is small then we have a significative first and second autocorrelation
+# This would mean that we have a very short term momentum or mean reverting in our residuals
+pvalues_ljung_box_first=[(acf_res[asset][2][0]) for asset in data_returns.columns]
+pvalues_ljung_box_second=[(acf_res[asset][2][1]) for asset in data_returns.columns]
+# We see that some p values are high but most of them are very low, we do have an effect to capture here
+sign_first_acf=[(np.sign(acf_res[asset][0][1])) for asset in data_returns.columns]
+# The sign of the first acf coef is almost always negative: we have a mean reverting effect on the first period
+sign_second_acf=[(np.sign(acf_res[asset][0][2])) for asset in data_returns.columns]
+# looking at the next coefficiants shows us that actually the mean reverting effect last a few periods (around 5/6)
+# but it is much more unclear, we need to make sure to close very soon the positions
+
+
+
+
+### PnL reporting
+cumret=ret.cumsum()
+plot([Scattergl(x=cumret.index,y=cumret)])
+
 
 
 pass  # debug

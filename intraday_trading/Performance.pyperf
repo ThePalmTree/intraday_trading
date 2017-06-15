@@ -1,0 +1,7 @@
+<?xml version="1.0"?>
+<ProfilingTarget xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <ProjectTarget>
+    <TargetProject>b6af1aff-0416-496f-a143-36ee234c032a</TargetProject>
+    <FriendlyName>intraday_trading</FriendlyName>
+  </ProjectTarget>
+</ProfilingTarget>
