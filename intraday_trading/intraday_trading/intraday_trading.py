@@ -57,10 +57,10 @@ def compute_returns(df, col_index=None, window=1):
     if not col_index:
         col_index=df.columns
     for col in col_index:
-        res[col] = ((1+df.loc[:,col])/(1+df.loc[:,col].shift(window))) - 1
+        res[col] = df.loc[:,col]/df.loc[:,col].shift(window) - 1
     return res
 
-stock_data,index_data=dataset_building(n_max=10000,verbose=1)
+stock_data,index_data=dataset_building(n_max=50000,verbose=1)
 #data=stock_data.join(index_data,how='outer')
 data=index_data
 data.dropna(inplace=True)
@@ -76,7 +76,6 @@ data_returns.dropna(inplace=True)
 lr={asset:LinearRegression() for asset in data_prices.columns}
 lasso={asset:Lasso() for asset in data_prices.columns}
 
-
 models=lr
 
 ##########################################################################################################
@@ -90,18 +89,21 @@ models=lr
 
 # Global params
 rolling_window_size=720 # The number of data points we need to build our models, 720 for one day
-transaction_cost=0.05 # in returns for a trade (entry and exit included)
+transaction_cost=0.1 # in returns for a trade (entry and exit included)
 data_size=len(data_returns.index)
 validation_set_size=int(data_size/4)
 testing_set_size=data_size-validation_set_size
 
 
 # Hyperparameters grid: 
-threshold_grid=[2,3,4,5] # the limit on z score of the residual after which we trade
-max_holding_period_grid=[1,5,10,15] # holding period of the positions
+threshold_grid=[1.5,2,3,4,5] # the limit on z score of the residual after which we trade
+max_holding_period_grid=[1,3,5,10,15] # holding period of the positions
+#threshold_grid=[2] # the limit on z score of the residual after which we trade
+#max_holding_period_grid=[1] # holding period of the positions
+
 
 # We define a class to keep track of our trading strategy
-class trading_strategy():
+class TradingStrategy():
     ''' This class will help us keep track of our trading strategy '''
     def __init__(self, models, data_returns, data_prices, rolling_window_size, transaction_cost):
         self.models=models
@@ -138,6 +140,8 @@ class trading_strategy():
         print(today) # debug
         if not self.active_pos:
             train=self.data_returns.index[i-self.rolling_window_size:i-1]
+            max_resi=0  
+            max_asset=None
             for asset in self.data_returns.columns:  
                 other_assets=self.data_returns.columns.drop(asset)
                 Y=self.data_returns.loc[train,asset]
@@ -145,41 +149,52 @@ class trading_strategy():
                 self.models[asset].fit(X, Y)
                 resi=Y-self.models[asset].predict(X) # These are the residuals
                 self.norm_resi.loc[today,asset]=resi[-1]/np.std(resi) # This is our last residual 
-                if abs(self.norm_resi.loc[today,asset])>self.threshold:
-                    self.pos.loc[today,asset]=-np.sign(self.norm_resi.loc[today,asset]) # we take a position on the asset
-                    self.pos.loc[today,other_assets]=np.sign(self.norm_resi.loc[today,asset])*models[asset].coef_ # we build the arbitrage portfolio
+                if abs(self.norm_resi.loc[today,asset])>max_resi:
+                    max_resi=self.norm_resi.loc[today,asset]
+                    max_asset=asset
+            if abs(max_resi)>self.threshold:
+                    other_assets=self.data_returns.columns.drop(max_asset)
+                    self.pos.loc[today,max_asset]=-np.sign(max_resi) # we take a position on the asset
+                    self.pos.loc[today,other_assets]=np.sign(max_resi)*models[max_asset].coef_ # we build the arbitrage portfolio
                     self.holding_period=0
                     self.entry_prices=self.data_prices.loc[today,:] # we record the entry prices
                     self.active_pos=True
                     print('position open')
-                    return
-            return
         else: # in case of an active position we just wait for the mean reversion
             self.holding_period += 1
             self.pos.iloc[i,:]=self.pos.iloc[i-1,:]
             if self.holding_period>=self.max_holding_period: # we close after a few periods, and record the pnl of the trade
-                self.ret[today]=sum(self.pos.loc[today,:]*((self.data_prices.loc[today,:]-self.entry_prices)/self.entry_prices-self.transaction_cost))
+                self.ret[today]=sum(self.pos.loc[today,:]*(self.data_prices.loc[today,:]/self.entry_prices-1-self.transaction_cost))
                 self.pos.loc[today,:]=0.0
                 self.active_pos=False
                 print('position closed, Return: {:f}'.format(self.ret[today]))
-            return
     
     def set_hp(self, **kwargs):
         ''' Used to change the value of the hyperparameters '''
         for name in kwargs:
             setattr(self,name, kwargs[name])
  
-    def print_cumret(self):
+    def plot_cumret(self):
         ''' Used to print the cumulated returns '''
         cumret=self.ret.cumsum()
         plot([Scattergl(x=cumret.index,y=cumret)])
 
-TS=trading_strategy(models, data_returns, data_prices, rolling_window_size, transaction_cost)
+    def compute_outputs(self):
+        ''' Produce a set of outputs '''
+        self.sharpe=None    
+        self.beta=None
+        self.alpha=None
+        self.vol=None
+        self.sortino=None
+        self.max_drawdown=None
+
+
+TS=TradingStrategy(models, data_returns, data_prices, rolling_window_size, transaction_cost)
 
 # Validation
 for threshold in threshold_grid:
-    TS.reinit()
     for max_holding_period in max_holding_period_grid:
+        TS.reinit()
         print('Threshold:{}, Max Holding Period:{}'.format(threshold, max_holding_period))
         TS.set_hp(threshold=threshold, max_holding_period=max_holding_period)
         for i in range(rolling_window_size,validation_set_size):
@@ -188,11 +203,17 @@ for threshold in threshold_grid:
         if score>TS.best_score_valid:
             TS.best_score_valid=score
             TS.best_hp={'threshold':threshold, 'max_holding_period':max_holding_period}
-    
+
+# Best hyperparameters
+TS.best_hp    
+
+# Plot of the returns IS
+TS.plot_cumret()
+
 # Testing
 TS.reinit()
-TS.set_hp(*{TS.best_hp})
-for i in range(rolling_window_size,len(data.returns)):
+TS.set_hp(**TS.best_hp)
+for i in range(rolling_window_size,len(data_returns.index)):
     TS.one_period(i)
 
 
@@ -212,8 +233,8 @@ pacf_res={}
 
 # Stationarity tests
 for asset in data_returns.columns:
-    adf_res[asset]=adfuller(norm_resi[asset])         
-    kpss_res[asset]=kpss(norm_resi[asset])
+    adf_res[asset]=adfuller(TS.norm_resi[asset])         
+    kpss_res[asset]=kpss(TS.norm_resi[asset])
 
 pvalues_adf=[adf_res[asset][1] for asset in data_returns.columns] # very low p values for ADF
 pvalues_kpss=[kpss_res[asset][1] for asset in data_returns.columns] # very high (max is 0.1) p values for KPSS
@@ -241,9 +262,7 @@ sign_second_acf=[(np.sign(acf_res[asset][0][2])) for asset in data_returns.colum
 
 
 ### PnL reporting
-cumret=ret.cumsum()
-plot([Scattergl(x=cumret.index,y=cumret)])
-
+TS.plot_cumret()
 
 
 pass  # debug
