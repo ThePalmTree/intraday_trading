@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import datetime
 from sklearn.linear_model import LinearRegression, Lasso, LassoCV, ElasticNet, ElasticNetCV, Ridge, RidgeCV 
+from sklearn.model_selection import ParameterGrid
 from statsmodels.tsa.arima_model import ARIMA
 from statsmodels.tsa.stattools import adfuller, kpss, acf, pacf
 from plotly.offline import plot
@@ -63,8 +64,8 @@ def compute_returns(df, col_index=None, window=1):
 stock_data,index_data=dataset_building(n_max=50000,verbose=1)
 #data=stock_data.join(index_data,how='outer')
 data=index_data
-data.dropna(inplace=True)
-data_prices=compute_prices(data).apply(pd.to_numeric)
+data.dropna(inplace=True)  
+data_prices=compute_prices(data)
 data_returns=compute_returns(data_prices)
 data_returns.dropna(inplace=True)
 
@@ -74,10 +75,9 @@ data_returns.dropna(inplace=True)
 
 # we build a model for each asset
 lr={asset:LinearRegression() for asset in data_prices.columns}
-lasso={asset:Lasso() for asset in data_prices.columns}
-
-models=lr
-
+lasso={asset:Lasso(normalize=True) for asset in data_prices.columns}
+models=lasso
+ 
 ##########################################################################################################
 ### TRADING STRATEGY ###
 ##########################################################################################################
@@ -89,56 +89,50 @@ models=lr
 
 # Global params
 rolling_window_size=720 # The number of data points we need to build our models, 720 for one day
-transaction_cost=0.1 # in returns for a trade (entry and exit included)
+transaction_cost=0.0 #0.0005 # in percent for a trade (entry and exit included), 5 bps by default
 data_size=len(data_returns.index)
 validation_set_size=int(data_size/4)
 testing_set_size=data_size-validation_set_size
 
 
 # Hyperparameters grid: 
-threshold_grid=[1.5,2,3,4,5] # the limit on z score of the residual after which we trade
-max_holding_period_grid=[1,3,5,10,15] # holding period of the positions
-#threshold_grid=[2] # the limit on z score of the residual after which we trade
-#max_holding_period_grid=[1] # holding period of the positions
+hp_grid={'threshold':[1.5,2,3,4,5], # the limit on z score of the residual after which we trade
+         'max_holding_period':[1,2,5,10,15,30,60]} # holding period of the positions
 
 
 # We define a class to keep track of our trading strategy
 class TradingStrategy():
     ''' This class will help us keep track of our trading strategy '''
-    def __init__(self, models, data_returns, data_prices, rolling_window_size, transaction_cost):
+    def __init__(self, models, data_returns, data_prices, rolling_window_size, validation_set_size, transaction_cost):
         self.models=models
         self.data_returns=data_returns
         self.data_prices=data_prices
         self.transaction_cost=transaction_cost
         self.rolling_window_size=rolling_window_size
-        self.norm_resi={} # The norm residuals are the residuals normalized by their std dev
-        self.ret=pd.Series(0.0,index=data_returns.index) # keep track of the realized pnl
-        self.pos=pd.DataFrame(0.0,index=data_returns.index, columns=data_prices.columns) # keep track of the positions
-        self.norm_resi=pd.DataFrame(index=data_returns.index, columns=data_prices.columns) # nomalized residuals
-        self.active_pos=False # this will help us keep track of our open strategy, and make sure we have only one strategy running at the same time
+        self.validation_set_size=validation_set_size
+        self.ret=pd.Series(0.0,index=data_returns.index) # keep track of the realized returns
+        self.m_resi=pd.Series(index=data_returns.index) # keep track of the max residuals
+        self.m_asset=pd.Series(index=data_returns.index) # keep track of the asset on which we have the max resi
+        self.pos=pd.Series(index=data_returns.columns)
+        self.active_pos=False # this will help us keep track of our open position, and make sure we have only one strategy running at the same time
         self.holding_period=0
         self.entry_prices=pd.DataFrame()
-        self.best_hp={}
-        self.best_score_valid=-np.Inf
-
         # Hyperparameters
         self.threshold=None
         self.max_holding_period=None
 
     def reinit(self):
-        self.norm_resi={} # The norm residuals are the residuals normalized by their std dev
         self.ret=pd.Series(0.0,index=data_returns.index) # keep track of the realized pnl
-        self.pos=pd.DataFrame(0.0,index=data_returns.index, columns=data_prices.columns) # keep track of the positions
-        self.norm_resi=pd.DataFrame(index=data_returns.index, columns=data_prices.columns) # nomalized residuals
         self.active_pos=False # this will help us keep track of our open strategy, and make sure we have only one strategy running at the same time
         self.holding_period=0
         self.entry_prices=pd.DataFrame()
         
-    def one_period(self, i):
-        ''' This function will operate one trading period '''
-        today=self.data_returns.index[i]
-        print(today) # debug
-        if not self.active_pos:
+    def compute_resi(self, begin, end, verbose=False):
+        ''' This function will compute the residuals on a certain period '''
+        if verbose: print('Calculating Residuals...')
+        for i in range(begin, end):
+            today=self.data_returns.index[i]
+            #if verbose: print(today) # debug
             train=self.data_returns.index[i-self.rolling_window_size:i-1]
             max_resi=0  
             max_asset=None
@@ -148,74 +142,96 @@ class TradingStrategy():
                 X=self.data_returns.loc[train,other_assets]
                 self.models[asset].fit(X, Y)
                 resi=Y-self.models[asset].predict(X) # These are the residuals
-                self.norm_resi.loc[today,asset]=resi[-1]/np.std(resi) # This is our last residual 
-                if abs(self.norm_resi.loc[today,asset])>max_resi:
-                    max_resi=self.norm_resi.loc[today,asset]
+                norm_resi=resi[-1]/np.std(resi) # This is our normalized last residual 
+                if abs(norm_resi)>max_resi:
+                    max_resi=norm_resi
                     max_asset=asset
-            if abs(max_resi)>self.threshold:
-                    other_assets=self.data_returns.columns.drop(max_asset)
-                    self.pos.loc[today,max_asset]=-np.sign(max_resi) # we take a position on the asset
-                    self.pos.loc[today,other_assets]=np.sign(max_resi)*models[max_asset].coef_ # we build the arbitrage portfolio
-                    self.holding_period=0
-                    self.entry_prices=self.data_prices.loc[today,:] # we record the entry prices
-                    self.active_pos=True
-                    print('position open')
-        else: # in case of an active position we just wait for the mean reversion
-            self.holding_period += 1
-            self.pos.iloc[i,:]=self.pos.iloc[i-1,:]
-            if self.holding_period>=self.max_holding_period: # we close after a few periods, and record the pnl of the trade
-                self.ret[today]=sum(self.pos.loc[today,:]*(self.data_prices.loc[today,:]/self.entry_prices-1-self.transaction_cost))
-                self.pos.loc[today,:]=0.0
-                self.active_pos=False
-                print('position closed, Return: {:f}'.format(self.ret[today]))
+            self.m_resi[today]=max_resi
+            self.m_asset[today]=max_asset
+        if verbose: print('Residuals calculated')        
+     
+    def compute_strat(self, begin, end, verbose=False):
+        ''' This function will compute the strategy on a certain period, we need to compute the residuals first '''
+        if verbose: print('Calculating Strategy...')
+        for i in range(begin, end):     
+            today=self.data_returns.index[i]   
+            if not self.active_pos: # we look for a signal on our max residual
+                 if abs(self.m_resi[today])>self.threshold: # should I trade only when the resi is above the transaction cost?
+                     other_assets=self.data_returns.columns.drop(self.m_asset[today])
+                     self.pos[self.m_asset[today]]=-np.sign(self.m_resi[today]) # we take a position on the asset
+                     self.pos[other_assets]=np.sign(self.m_resi[today])*models[self.m_asset[today]].coef_ # we build the arbitrage portfolio
+                     self.holding_period=0
+                     self.entry_prices=self.data_prices.loc[today,:] # we record the entry prices
+                     self.active_pos=True
+                     if verbose: print('{}: Position open'.format(today))
+            else: # in case of an active position we just wait for the mean reversion
+                self.holding_period += 1
+                if self.holding_period>=self.max_holding_period: # we close after a few periods, and record the pnl of the trade
+                    self.ret[today]=sum(self.pos*(self.data_prices.loc[today,:]/self.entry_prices-1))-abs(self.pos.sum())*self.transaction_cost
+                    self.pos[:]=0.0
+                    self.active_pos=False
+                    if verbose: print('{}: Position closed, Return: {:f}'.format(today, self.ret[today]))
+        if verbose: print('Strategy calculated')
     
-    def set_hp(self, **kwargs):
+    def validation(self, hp_grid, verbose=False):
+        ''' Validation step ''' 
+        self.best_hp={}
+        self.scores={}
+        self.best_score_valid=-np.Inf
+        self.compute_resi(self.rolling_window_size, self.validation_set_size, verbose)
+        for hp in ParameterGrid(hp_grid):
+            self.reinit()
+            if verbose: print('Threshold:{}, Max Holding Period:{}'.format(hp['threshold'], hp['max_holding_period']))
+            self.set_hp(**hp)
+            self.compute_strat(self.rolling_window_size, self.validation_set_size, verbose)
+            score=self.ret.sum()
+            self.scores[(hp['threshold'], hp['max_holding_period'])]=score # we record each score
+            if score>self.best_score_valid:
+                self.best_score_valid=score
+                self.best_hp=hp
+        self.set_hp(**self.best_hp)
+
+    def testing(self, include_val_period=False, verbose=False):
+        ''' Testing step '''
+        self.reinit()
+        self.set_hp(**self.best_hp)        
+        begin = self.rolling_window_size if include_val_period else self.validation_set_size
+        self.compute_resi(self.rolling_window_size, len(self.data_returns.index), verbose)
+        self.compute_strat(self.rolling_window_size, len(self.data_returns.index), verbose)
+
+    def set_hp(self, **hp):
         ''' Used to change the value of the hyperparameters '''
-        for name in kwargs:
-            setattr(self,name, kwargs[name])
+        for name in hp:
+            setattr(self, name, hp[name])
  
     def plot_cumret(self):
         ''' Used to print the cumulated returns '''
-        cumret=self.ret.cumsum()
-        plot([Scattergl(x=cumret.index,y=cumret)])
+        self.compute_outputs()
+        plot([Scattergl(x=self.cumret.index,y=self.cumret)]) # We use plotly to plot
 
     def compute_outputs(self):
         ''' Produce a set of outputs '''
-        self.sharpe=None    
-        self.beta=None
-        self.alpha=None
-        self.vol=None
-        self.sortino=None
-        self.max_drawdown=None
+        self.cumret=self.ret.cumsum()
+        self.beta={}
+        self.alpha={}
+        for asset in self.data_returns.columns:    
+            self.beta[asset]=self.ret.cov(pd.to_numeric(self.data_returns[asset]))
+            self.alpha[asset]=np.mean(self.ret)-self.beta[asset]*np.mean(self.data_returns[asset]) # anualized?
+        nb_y=(self.ret.index[-1]-self.ret.index[0])/datetime.timedelta(days=252)
+        self.vol=np.std(self.ret)*np.sqrt(252*720) # annualized vol
+        self.sharpe=self.cumret[-1]/(self.vol*nb_y) # annualized sharpe
+        #self.max_drawdown=None
 
-
-TS=TradingStrategy(models, data_returns, data_prices, rolling_window_size, transaction_cost)
+TS=TradingStrategy(models, data_returns, data_prices, rolling_window_size, validation_set_size, transaction_cost)
 
 # Validation
-for threshold in threshold_grid:
-    for max_holding_period in max_holding_period_grid:
-        TS.reinit()
-        print('Threshold:{}, Max Holding Period:{}'.format(threshold, max_holding_period))
-        TS.set_hp(threshold=threshold, max_holding_period=max_holding_period)
-        for i in range(rolling_window_size,validation_set_size):
-            TS.one_period(i)
-        score=TS.ret.sum()
-        if score>TS.best_score_valid:
-            TS.best_score_valid=score
-            TS.best_hp={'threshold':threshold, 'max_holding_period':max_holding_period}
+TS.validation(hp_grid, verbose=1)
 
 # Best hyperparameters
 TS.best_hp    
 
-# Plot of the returns IS
-TS.plot_cumret()
-
 # Testing
-TS.reinit()
-TS.set_hp(**TS.best_hp)
-for i in range(rolling_window_size,len(data_returns.index)):
-    TS.one_period(i)
-
+TS.testing(verbose=1)
 
 ##########################################################################################################
 ### OUTPUTS & STAT TESTS ###
@@ -233,8 +249,14 @@ pacf_res={}
 
 # Stationarity tests
 for asset in data_returns.columns:
-    adf_res[asset]=adfuller(TS.norm_resi[asset])         
-    kpss_res[asset]=kpss(TS.norm_resi[asset])
+    try:
+        adf_res[asset]=adfuller(TS.norm_resi[asset].dropna())         
+    except:
+        adf_res[asset]=[np.nan for _ in range(5)]
+    try:
+        kpss_res[asset]=kpss(TS.norm_resi[asset].dropna())
+    except:
+        kpss_res[asset]=[np.nan for _ in range(5)]
 
 pvalues_adf=[adf_res[asset][1] for asset in data_returns.columns] # very low p values for ADF
 pvalues_kpss=[kpss_res[asset][1] for asset in data_returns.columns] # very high (max is 0.1) p values for KPSS
@@ -243,8 +265,7 @@ pvalues_kpss=[kpss_res[asset][1] for asset in data_returns.columns] # very high 
 
 # ACF and PACF to check the mean reverting effect
 for asset in data_returns.columns:
-   acf_res[asset]=acf(norm_resi[asset],qstat=True)
-   pacf_res[asset]=pacf(norm_resi[asset])
+   acf_res[asset]=acf(pd.to_numeric(TS.norm_resi[asset].dropna()),qstat=True)
 
 # We look at the p values for the first and second coefficiant of the ljung box test
 # If the p value is small then we have a significative first and second autocorrelation
@@ -261,8 +282,9 @@ sign_second_acf=[(np.sign(acf_res[asset][0][2])) for asset in data_returns.colum
 
 
 
-### PnL reporting
+### PnL reporting and risk measure
 TS.plot_cumret()
+TS.vol
 
 
 pass  # debug
