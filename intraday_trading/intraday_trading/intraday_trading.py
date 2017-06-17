@@ -61,7 +61,7 @@ def compute_returns(df, col_index=None, window=1):
         res[col] = df.loc[:,col]/df.loc[:,col].shift(window) - 1
     return res
 
-stock_data,index_data=dataset_building(n_max=50000,verbose=1)
+stock_data,index_data=dataset_building(n_max=None,verbose=1)
 #data=stock_data.join(index_data,how='outer')
 data=index_data
 data.dropna(inplace=True)  
@@ -75,7 +75,9 @@ data_returns.dropna(inplace=True)
 
 # we build a model for each asset
 lr={asset:LinearRegression() for asset in data_prices.columns}
-lasso={asset:Lasso(normalize=True) for asset in data_prices.columns}
+lasso={asset:Lasso(normalize=True) for asset in data_prices.columns} 
+# since we normalized the input we can let alpha=1, the best would be to cross validate it
+# but it would be to heavy in terms of computations
 models=lasso
  
 ##########################################################################################################
@@ -196,13 +198,17 @@ class TradingStrategy():
         self.reinit()
         self.set_hp(**self.best_hp)        
         begin = self.rolling_window_size if include_val_period else self.validation_set_size
-        self.compute_resi(self.rolling_window_size, len(self.data_returns.index), verbose)
-        self.compute_strat(self.rolling_window_size, len(self.data_returns.index), verbose)
+        self.compute_resi(self.validation_set_size, len(self.data_returns.index), verbose)
+        self.compute_strat(begin, len(self.data_returns.index), verbose)
+
+    def valid_test(self, include_val_period=False, verbose=False):
+        ''' Validation & Testing '''
+        self.validation(verbose)
+        self.testing(include_val_period, verbose)
 
     def set_hp(self, **hp):
         ''' Used to change the value of the hyperparameters '''
-        for name in hp:
-            setattr(self, name, hp[name])
+        for name in hp: setattr(self, name, hp[name])
  
     def plot_cumret(self):
         ''' Used to print the cumulated returns '''
@@ -233,61 +239,11 @@ TS.best_hp
 # Testing
 TS.testing(verbose=1)
 
-##########################################################################################################
-### OUTPUTS & STAT TESTS ###
-##########################################################################################################
-
-### Before checking the PnL let us check some of our assumptions
-
-# The most important is the mean reverting behavior of our residuals
-resi={}
-adf_res={}
-kpss_res={}
-arima_res={}
-acf_res={}
-pacf_res={}
-
-# Stationarity tests
-for asset in data_returns.columns:
-    try:
-        adf_res[asset]=adfuller(TS.norm_resi[asset].dropna())         
-    except:
-        adf_res[asset]=[np.nan for _ in range(5)]
-    try:
-        kpss_res[asset]=kpss(TS.norm_resi[asset].dropna())
-    except:
-        kpss_res[asset]=[np.nan for _ in range(5)]
-
-pvalues_adf=[adf_res[asset][1] for asset in data_returns.columns] # very low p values for ADF
-pvalues_kpss=[kpss_res[asset][1] for asset in data_returns.columns] # very high (max is 0.1) p values for KPSS
-# The test seems to confirm  the stationarity of this time serie
-
-
-# ACF and PACF to check the mean reverting effect
-for asset in data_returns.columns:
-   acf_res[asset]=acf(pd.to_numeric(TS.norm_resi[asset].dropna()),qstat=True)
-
-# We look at the p values for the first and second coefficiant of the ljung box test
-# If the p value is small then we have a significative first and second autocorrelation
-# This would mean that we have a very short term momentum or mean reverting in our residuals
-pvalues_ljung_box_first=[(acf_res[asset][2][0]) for asset in data_returns.columns]
-pvalues_ljung_box_second=[(acf_res[asset][2][1]) for asset in data_returns.columns]
-# We see that some p values are high but most of them are very low, we do have an effect to capture here
-sign_first_acf=[(np.sign(acf_res[asset][0][1])) for asset in data_returns.columns]
-# The sign of the first acf coef is almost always negative: we have a mean reverting effect on the first period
-sign_second_acf=[(np.sign(acf_res[asset][0][2])) for asset in data_returns.columns]
-# looking at the next coefficiants shows us that actually the mean reverting effect last a few periods (around 5/6)
-# but it is much more unclear, we need to make sure to close very soon the positions
-
-
-
 
 ### PnL reporting and risk measure
 TS.plot_cumret()
 TS.vol
 
-
-pass  # debug
 
 
 
